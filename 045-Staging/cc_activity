@@ -1,4 +1,4 @@
-create or replace TABLE L001_BRONZE."cc_activity" (
+create or replace TABLE L01_BRONZE."cc_activity" (
 	"LoadCommandID" NUMBER(38,0),
 	"PreviousGroupID" NUMBER(38,0),
 	"EndDate" TIMESTAMP_TZ(9),
