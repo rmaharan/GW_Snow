@@ -1,0 +1,161 @@
+import streamlit as st
+from snowflake.snowpark.context import get_active_session
+import pandas as pd
+
+session = get_active_session()
+st.markdown(
+    """
+    <style>
+    .main {
+        max-width: 1000px !important;
+        padding-left: 2rem;
+        padding-right: 2rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+# -------------------------------------------------------------------
+# Config
+# -------------------------------------------------------------------
+CDA_DB = "DATALAB_DEV_STREAMLIT_DB"
+CDA_SCHEMA = "GWPC"
+MANIFEST_TABLE = "DATALAB_DEV_STREAMLIT_DB.GWPC.MANIFEST_CDA"
+ 
+# JSON keys in MANIFEST_TABLE.DATA_PAYLOAD
+MANIFEST_KEYS = {
+    "batch": "batchTimestamp",
+    "table": "tableName",
+    "schema": "schemaId",
+    "num_written": "numRecordsWritten",
+    "num_read": "numRecordsRead"
+}
+ 
+# -------------------------------------------------------------------
+# Page title & description
+# -------------------------------------------------------------------
+st.title("📊 CDA vs Manifest Validation")
+st.write("Filter by date range -> view count comparison")
+
+ 
+# -------------------------------------------------------------------
+# Load manifest records
+# -------------------------------------------------------------------
+manifest_query = f"""
+SELECT
+TO_TIMESTAMP_LTZ(DATA_PAYLOAD:{MANIFEST_KEYS['batch']}::NUMBER / 1000) AS BATCHTIMESTAMP,
+UPPER(DATA_PAYLOAD:{MANIFEST_KEYS['table']}::STRING) AS TABLENAME,
+UPPER(DATA_PAYLOAD:{MANIFEST_KEYS['schema']}::STRING) AS SCHEMAID,
+DATA_PAYLOAD:{MANIFEST_KEYS['num_written']}::NUMBER AS NUMRECORDSWRITTEN
+FROM {MANIFEST_TABLE}
+ORDER BY BATCHTIMESTAMP DESC;
+"""
+ 
+manifest_df = session.sql(manifest_query).to_pandas()
+# -------------------------------------------------------------------
+# Date filters
+# -------------------------------------------------------------------
+min_date = manifest_df["BATCHTIMESTAMP"].min().date()
+max_date = manifest_df["BATCHTIMESTAMP"].max().date()
+
+col1, col2 = st.columns(2)
+with col1:
+    from_date = st.date_input("From date", min_date, format="YYYY/MM/DD")
+    #from_date = st.date_input("From date",format="YYYY/MM/DD")
+with col2:
+    to_date = st.date_input("To date", max_date, format="YYYY/MM/DD")
+    #to_date = st.date_input("To date",format="YYYY/MM/DD")
+    
+if st.button("Run Reconcilliation"): 
+    filtered_manifest = manifest_df[
+    (manifest_df["BATCHTIMESTAMP"].dt.date >= from_date) &
+    (manifest_df["BATCHTIMESTAMP"].dt.date <= to_date)
+    ]
+ 
+    if filtered_manifest.empty:
+        st.warning("No manifest rows in this date range.")
+        st.stop()
+
+# -------------------------------------------------------------------
+# CDA Count comparison
+# -------------------------------------------------------------------
+    comparison_results = [] 
+    for _, row in filtered_manifest.iterrows():
+        table_name = row["TABLENAME"]
+        schema_id  = row["SCHEMAID"]
+        batchts    = row["BATCHTIMESTAMP"]
+        num_written = row["NUMRECORDSWRITTEN"]
+    #st.write(table_name)
+    #st.write(schema_id)
+    #st.write(batchts)
+    #st.write(num_written)
+    # Construct CDA table name dynamically
+        cda_table = f"{CDA_DB}.{CDA_SCHEMA}.{table_name.upper()}_CDA"
+    #st.write(cda_table)
+    # Query CDA table
+        try:
+            cda_query = f"""
+            SELECT COUNT(*) AS RECORD_COUNT
+            FROM {cda_table}
+            WHERE TO_TIMESTAMP_LTZ(SPLIT_PART(METADATA_FILE_NAME, '/', 6)::NUMBER / 1000) = '{batchts}'
+            AND UPPER(SPLIT_PART(METADATA_FILE_NAME, '/', 5)) = '{schema_id}'
+            AND UPPER(SPLIT_PART(METADATA_FILE_NAME, '/', 4)) = '{table_name}'
+            """
+        #st.write(cda_query)
+            cda_count = session.sql(cda_query).to_pandas()["RECORD_COUNT"].iloc[0]
+        #st.write(cda_count)
+        except Exception:
+            cda_count = None  # table doesn't exist
+        # Compare
+        status = (
+            "NO CDA TABLE"
+            if cda_count is None
+            else "MATCH"
+            if cda_count == num_written
+            else "MISMATCH"
+        )
+        comparison_results.append(
+            {
+            "Batch Timestamp": batchts,
+            "Schema": schema_id,
+            "Table": table_name,
+            "CDA Count": cda_count,
+            "Manifest numRecordsWritten": num_written,
+            "Status": status,
+        }
+        )
+ 
+    result_df = pd.DataFrame(comparison_results)  
+
+# -------------------------------------------------------------------
+# Output layout
+# -------------------------------------------------------------------
+    tab1, tab2 = st.tabs([
+        "Comparison Result", 
+        "Mismatch Results"
+    ])
+    with tab1:
+            st.subheader("Comparison Result")
+            st.dataframe(result_df, use_container_width=False)
+ 
+            mismatch_df = result_df[result_df["Status"] == "MISMATCH"]
+            missing_df  = result_df[result_df["Status"] == "NO CDA TABLE"]
+            if not mismatch_df.empty:
+                st.error("❌ Mismatches found")
+ 
+    with tab2:
+            st.subheader("Mismatch Result")
+        
+            if not mismatch_df.empty:
+                st.error("❌ Mismatches found")
+                mismatch_count=mismatch_df['Status'].count()
+    # Show metric
+                st.metric("Total Mismatches",mismatch_count)
+                st.dataframe(mismatch_df)
+ 
+    if not missing_df.empty:
+        st.warning("⚠️ CDA table missing for some manifest entries")
+        st.dataframe(missing_df)
+ 
+    if mismatch_df.empty and missing_df.empty:
+        st.success("✅ All CDA table counts match manifest numRecordsWritten")
